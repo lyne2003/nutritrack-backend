@@ -436,7 +436,7 @@ def get_user_info(user_id: int, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    base_url = "http://10.0.2.2:8000"
+    base_url = "http://127.0.0.1:8000"
 
     # ✅ Fetch Dietary Restrictions (with ID)
     diet_query = text("""
@@ -565,3 +565,93 @@ def delete_user_allergy(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error deleting allergy: {e}")
+
+
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import fitz  # PyMuPDF
+import pytesseract
+from pdf2image import convert_from_path
+from PIL import Image
+import re, io, os, tempfile
+
+
+# 🧠 Utility function – Extract biomarkers
+def extract_lab_values(file_path: str):
+    text = ""
+
+    # If PDF
+    if file_path.lower().endswith(".pdf"):
+        doc = fitz.open(file_path)
+        for page in doc:
+            text += page.get_text("text") + "\n"
+
+        # If scanned (no text) → OCR
+        if len(text.strip()) < 50:
+            print("🟡 Scanned PDF detected — using OCR...")
+            images = convert_from_path(file_path)
+            for img in images:
+                text += pytesseract.image_to_string(img)
+        else:
+            print("🟢 Text-based PDF detected — no OCR needed.")
+
+    # If image
+    else:
+        print("🟡 Image detected — using OCR...")
+        img = Image.open(file_path)
+        text = pytesseract.image_to_string(img)
+
+    # Clean text
+    text = re.sub(r"\s+", " ", text)
+
+    # Regex patterns
+    patterns = {
+        "LDL": r"(?:ldl[\s\-c:]*)[:\s]*([\d.]+)",
+        "HDL": r"(?:hdl[\s\-c:]*)[:\s]*([\d.]+)",
+        "Triglycerides": r"(?:triglycerides?)[:\s]*([\d.]+)",
+        "Glucose": r"(?:glucose|fasting glucose|electrolytes and fasting glucose)[:\s]*(normal|[\d.]+)",
+        "Creatinine": r"(?:creatinine)[:\s]*([\d.]+)"
+    }
+
+    extracted = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            val = match.group(1)
+            if re.match(r"^\d+(\.\d+)?$", val):
+                extracted[key] = float(val)
+            else:
+                extracted[key] = val.capitalize()
+        else:
+            extracted[key] = None
+
+    return extracted
+
+
+# ============================================
+# 📍 FastAPI Endpoint
+# ============================================
+@app.post("/upload_lab_result_extract")
+async def upload_lab_result_extract(file: UploadFile = File(...)):
+    try:
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        # Extract biomarkers
+        extracted_data = extract_lab_values(tmp_path)
+
+        # Delete temp file
+        os.remove(tmp_path)
+
+        return JSONResponse(content={
+            "message": "Lab result processed successfully",
+            "data": extracted_data
+        })
+
+    except Exception as e:
+        print("❌ Error:", e)
+        raise HTTPException(status_code=500, detail=str(e))

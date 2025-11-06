@@ -43,3 +43,9 @@ APScheduler==3.11.0
 # Typing & validation support
 typing_extensions==4.14.1
 annotated-types==0.7.0
+
+# PDF & OCR Extraction
+PyMuPDF==1.24.9
+pdf2image==1.17.0
+pytesseract==0.3.13
+Pillow==11.3.0   # already included, keep as is
