@@ -1,3 +1,4 @@
+from urllib import request
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from database import Base, engine, SessionLocal
@@ -15,6 +16,9 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 from fastapi.security import HTTPBearer
 from fastapi import Security
+from models import SavedRecipe
+from schemas import SaveRecipeRequest
+import json
 
 security = HTTPBearer(auto_error=False)
 
@@ -38,6 +42,8 @@ def get_db():
 @app.post("/signup", response_model=UserResponse)
 def signup(user: UserCreate, db: Session = Depends(get_db)):
     existing_user = get_user_by_email(db, user.email)
+    print("PASSWORD:", user.password)
+    print("PASSWORD LENGTH:", len(user.password))
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     new_user = create_user(db, user.full_name, user.email, user.password)
@@ -54,7 +60,7 @@ def login(request: UserLogin, db: Session = Depends(get_db)):
         "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     }
     access_token = jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
-    return {"access_token": access_token, "token_type": "bearer","onboarding_completed": user.onboarding_completed,"user_id": user.id  }
+    return {"access_token": access_token, "token_type": "bearer","onboarding_completed": user.onboarding_completed,"user_id": user.id,"onboarding_step": user.onboarding_step,  }
 
 @app.put("/user/{user_id}/complete_onboarding")
 def complete_onboarding(user_id: int, db: Session = Depends(get_db)):
@@ -62,6 +68,7 @@ def complete_onboarding(user_id: int, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     user.onboarding_completed = True
+    user.onboarding_step = 5
     db.commit()
     db.refresh(user)
     return {"message": "Onboarding completed successfully"}
@@ -123,7 +130,7 @@ def set_user_dietary_restrictions(
                 text("INSERT INTO user_dietary_restrictions (user_id, dietary_id) VALUES (:user_id, :dietary_id)"),
                 {"user_id": user.id, "dietary_id": dietary_id},
             )
-
+        user.onboarding_step = 2
         db.commit()
         print("✅ Commit successful.")
         return {"message": "Dietary restrictions saved successfully"}
@@ -174,7 +181,7 @@ def set_user_allergies(
                 text("INSERT INTO user_allergies (user_id, allergy_id) VALUES (:user_id, :allergy_id)"),
                 {"user_id": user.id, "allergy_id": allergy_id},
             )
-
+        user.onboarding_step = 3
         db.commit()
         print("✅ Commit successful.")
         return {"message": "Allergies saved successfully"}
@@ -226,6 +233,8 @@ def set_user_servings(
             raise HTTPException(status_code=400, detail="Family count required")
 
     save_user_serving(db, user.id, selection.serving_id, family_count)
+    user.onboarding_step = 4
+    db.commit()
     return {"message": "Serving preference saved successfully"}
 
 
@@ -429,14 +438,14 @@ def get_user_lab_result(db: Session = Depends(get_db), credentials: dict = Secur
 from sqlalchemy import text
 
 @app.get("/user_info/{user_id}")
-def get_user_info(user_id: int, db: Session = Depends(get_db)):
+def get_user_info(user_id: int, request: Request, db: Session = Depends(get_db)):
     from sqlalchemy import text
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    base_url = "http://127.0.0.1:8000"
+    base_url = str(request.base_url).rstrip('/')
 
     # ✅ Fetch Dietary Restrictions (with ID)
     diet_query = text("""
@@ -470,10 +479,48 @@ def get_user_info(user_id: int, db: Session = Depends(get_db)):
         for row in db.execute(allergy_query, {"user_id": user_id}).fetchall()
     ]
 
-    # ✅ Fetch latest lab result (optional)
+    # ✅ Fetch Serving Preference
+    serving_query = text("""
+        SELECT s.id, s.name, s.logo_path, us.family_count
+        FROM user_servings us
+        JOIN servings s ON us.serving_id = s.id
+        WHERE us.user_id = :user_id
+    """)
+
+    serving_result = db.execute(serving_query, {"user_id": user_id}).fetchone()
+
+    serving = None
+    if serving_result:
+        sid, name, logo, family_count = serving_result
+
+        # Adjust label for family
+        if "family" in name.lower() and family_count:
+            name = f"Family of {family_count}"
+
+        serving = {
+            "id": sid,
+            "name": name,
+            "logo": f"{base_url}/static/logos/{logo}" if logo else None,
+            "family_count": family_count
+        }
+
+    # # ✅ Fetch latest lab result (optional)
+    # lab_result = db.execute(
+    #     text("""
+    #         SELECT filename
+    #         FROM lab_results
+    #         WHERE user_id = :user_id
+    #         ORDER BY uploaded_at DESC
+    #         LIMIT 1
+    #     """),
+    #     {"user_id": user_id},
+    # ).fetchone()
+
+    # lab_result_filename = lab_result[0] if lab_result else None
+
     lab_result = db.execute(
         text("""
-            SELECT filename
+            SELECT filename, glucose, ldl, hdl, triglycerides, creatinine
             FROM lab_results
             WHERE user_id = :user_id
             ORDER BY uploaded_at DESC
@@ -482,14 +529,43 @@ def get_user_info(user_id: int, db: Session = Depends(get_db)):
         {"user_id": user_id},
     ).fetchone()
 
-    lab_result_filename = lab_result[0] if lab_result else None
+    lab_data = None
+    lab_status = None
+    if lab_result:
+
+        lab_data = {
+            "filename": lab_result[0],
+            "glucose": lab_result[1],
+            "ldl": lab_result[2],
+            "hdl": lab_result[3],
+            "triglycerides": lab_result[4],
+            "creatinine": lab_result[5],
+        }
+
+        lab_status = classify_lab_results({
+            "Glucose": lab_result[1],
+            "LDL": lab_result[2],
+            "HDL": lab_result[3],
+            "Triglycerides": lab_result[4],
+            "Creatinine": lab_result[5],
+        })
 
     # ✅ Final response
+    # return {
+    #     "user_id": user_id,
+    #     "dietary_restrictions": diets,
+    #     "allergies": allergies,
+    #     "serving_preference": serving,   # 👈 ADD THIS
+    #     "lab_result_filename": lab_result_filename,
+    #     "lab_data": lab_data
+    # }
     return {
         "user_id": user_id,
         "dietary_restrictions": diets,
         "allergies": allergies,
-        "lab_result_filename": lab_result_filename,
+        "serving_preference": serving,
+        "lab_data": lab_data,
+        "lab_status": lab_status
     }
 
 
@@ -606,13 +682,17 @@ def extract_lab_values(file_path: str):
     # Clean text
     text = re.sub(r"\s+", " ", text)
 
+    print("\n================ EXTRACTED TEXT ================\n")
+    print(text)
+    print("\n===============================================\n")
+
     # Regex patterns
     patterns = {
-        "LDL": r"(?:ldl[\s\-c:]*)[:\s]*([\d.]+)",
-        "HDL": r"(?:hdl[\s\-c:]*)[:\s]*([\d.]+)",
-        "Triglycerides": r"(?:triglycerides?)[:\s]*([\d.]+)",
-        "Glucose": r"(?:glucose|fasting glucose|electrolytes and fasting glucose)[:\s]*(normal|[\d.]+)",
-        "Creatinine": r"(?:creatinine)[:\s]*([\d.]+)"
+        "LDL": r"LDL[−\-]?C\s*(?:calculé)?\s*([\d.]+)",
+        "HDL": r"HDL[−\-]?C\s*([\d.]+)",
+        "Triglycerides": r"Triglyc[ée]rides\s*([\d.]+)",
+        "Glucose": r"(?:Glucose|Fasting Glucose)\s*([\d.]+)",
+        "Creatinine": r"Cr[ée]atinine\s*([\d.]+)"
     }
 
     extracted = {}
@@ -629,29 +709,501 @@ def extract_lab_values(file_path: str):
 
     return extracted
 
+def classify_lab_results(data):
+
+    result = {}
+
+    # LDL
+    ldl = data.get("LDL")
+    if ldl is not None:
+        if ldl < 100:
+            result["LDL_status"] = "Healthy"
+        else:
+            result["LDL_status"] = "High"
+
+    # HDL
+    hdl = data.get("HDL")
+    if hdl is not None:
+        if hdl < 40:
+            result["HDL_status"] = "Low"
+        elif hdl < 60:
+            result["HDL_status"] = "Healthy"
+        else:
+            result["HDL_status"] = "High"
+
+    # Triglycerides
+    trig = data.get("Triglycerides")
+    if trig is not None:
+        if trig < 150:
+            result["Triglycerides_status"] = "Healthy"
+        else:
+            result["Triglycerides_status"] = "High"
+
+    # Glucose
+    glucose = data.get("Glucose")
+    if glucose is not None:
+        if glucose < 100:
+            result["Glucose_status"] = "Healthy"
+        else:
+            result["Glucose_status"] = "High"
+
+    # Creatinine
+    creatinine = data.get("Creatinine")
+    if creatinine is not None:
+        if creatinine < 0.6:
+            result["Creatinine_status"] = "Low"
+        elif creatinine <= 1.3:
+            result["Creatinine_status"] = "Healthy"
+        else:
+            result["Creatinine_status"] = "High"
+
+    return result
 
 # ============================================
 # 📍 FastAPI Endpoint
 # ============================================
+# @app.post("/upload_lab_result_extract")
+# async def upload_lab_result_extract(file: UploadFile = File(...)):
+#     try:
+#         # Save uploaded file temporarily
+#         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+#             tmp.write(await file.read())
+#             tmp_path = tmp.name
+
+#         # Extract biomarkers
+#         extracted_data = extract_lab_values(tmp_path)
+#         statuses = classify_lab_results(extracted_data)
+
+#         # Delete temp file
+#         os.remove(tmp_path)
+
+#         return {
+#         "message": "Lab result processed successfully",
+#         "data": extracted_data,
+#         "status": statuses
+#         }
+
+#     except Exception as e:
+#         print("❌ Error:", e)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+# @app.post("/upload_lab_result_extract")
+# async def upload_lab_result_extract(
+#     file: UploadFile = File(...),
+#     db: Session = Depends(get_db),
+#     credentials: dict = Security(security)
+# ):
+#     try:
+#         # ✅ Check token
+#         if not credentials:
+#             raise HTTPException(status_code=401, detail="Missing token")
+
+#         token = credentials.credentials
+#         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+#         email = payload.get("sub")
+
+#         user = db.query(User).filter(User.email == email).first()
+#         if not user:
+#             raise HTTPException(status_code=404, detail="User not found")
+
+#         # ✅ Save uploaded file temporarily
+#         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+#             tmp.write(await file.read())
+#             tmp_path = tmp.name
+
+#         # ✅ Extract biomarkers
+#         extracted_data = extract_lab_values(tmp_path)
+
+#         # ✅ Delete temp file
+#         os.remove(tmp_path)
+
+#         # ✅ SAVE ONLY ONCE 🔥
+#         lab = LabResult(
+#             user_id=user.id,
+#             filename=file.filename,
+#             glucose=extracted_data.get("Glucose"),
+#             ldl=extracted_data.get("LDL"),
+#             hdl=extracted_data.get("HDL"),
+#             triglycerides=extracted_data.get("Triglycerides"),
+#             creatinine=extracted_data.get("Creatinine")
+#         )
+
+#         db.add(lab)
+#         db.commit()
+#         db.refresh(lab)
+
+#         return {
+#             "message": "Lab result processed & saved successfully",
+#             "data": extracted_data
+#         }
+
+#     except Exception as e:
+#         db.rollback()
+#         print("❌ Error:", e)
+#         raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/upload_lab_result_extract")
-async def upload_lab_result_extract(file: UploadFile = File(...)):
+async def upload_lab_result_extract(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    credentials: dict = Security(security)
+):
     try:
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+        # ✅ Check token
+        if not credentials:
+            raise HTTPException(status_code=401, detail="Missing token")
+
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+
+        user = db.query(User).filter(User.email == email).first()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # ✅ Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=os.path.splitext(file.filename)[1]
+        ) as tmp:
+
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # Extract biomarkers
+        # ✅ Extract biomarkers
         extracted_data = extract_lab_values(tmp_path)
 
-        # Delete temp file
+        # ✅ Generate statuses
+        statuses = classify_lab_results(extracted_data)
+
+        print("EXTRACTED DATA:", extracted_data)
+        print("STATUSES:", statuses)
+
+        # ✅ Delete temp file
         os.remove(tmp_path)
 
-        return JSONResponse(content={
+        # ✅ Save to DB
+        lab = LabResult(
+            user_id=user.id,
+            filename=file.filename,
+            glucose=extracted_data.get("Glucose"),
+            ldl=extracted_data.get("LDL"),
+            hdl=extracted_data.get("HDL"),
+            triglycerides=extracted_data.get("Triglycerides"),
+            creatinine=extracted_data.get("Creatinine")
+        )
+
+        db.add(lab)
+        db.commit()
+        db.refresh(lab)
+
+        return {
             "message": "Lab result processed successfully",
-            "data": extracted_data
-        })
+            "data": extracted_data,
+            "status": statuses
+        }
 
     except Exception as e:
+        db.rollback()
         print("❌ Error:", e)
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.delete("/user/lab_result")
+def delete_lab_result(
+    db: Session = Depends(get_db),
+    credentials: dict = Security(security)
+):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    token = credentials.credentials
+    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    email = payload.get("sub")
+
+    user = db.query(User).filter(User.email == email).first()
+
+    lab = db.query(LabResult)\
+        .filter(LabResult.user_id == user.id)\
+        .order_by(LabResult.uploaded_at.desc())\
+        .first()
+
+    if not lab:
+        raise HTTPException(status_code=404, detail="No lab result found")
+
+    db.delete(lab)
+    db.commit()
+
+    return {"message": "Lab result deleted"}
+
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
+@app.post("/google-login")
+def google_login(data: dict, db: Session = Depends(get_db)):
+
+    email = data.get("email")
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    user = db.query(User).filter(User.email == email).first()
+
+    # 🔐 Create token function inline (same as login)
+    def generate_token(user_email):
+        token_data = {
+            "sub": user_email,
+            "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        }
+        return jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
+
+    if not user:
+        # 🔥 NEW USER
+        user = User(
+            email=email,
+            onboarding_completed=False,
+            onboarding_step=1
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        return {
+            "access_token": generate_token(user.email),
+            "onboarding_completed": False,
+            "user_id": user.id,
+            "onboarding_step": user.onboarding_step
+        }
+
+    # 🔥 EXISTING USER
+    return {
+        "access_token": generate_token(user.email),
+        "onboarding_completed": user.onboarding_completed,
+        "onboarding_step": user.onboarding_step,
+        "user_id": user.id
+    }
+
+
+
+@app.put("/user/servings")
+def update_user_servings(
+    selection: UserServingSelection,
+    db: Session = Depends(get_db),
+    credentials: dict = Security(security)
+):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    token = credentials.credentials
+    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    email = payload.get("sub")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    family_count = selection.family_count
+
+    serving = db.query(Serving).filter(Serving.id == selection.serving_id).first()
+    if not serving:
+        raise HTTPException(status_code=404, detail="Invalid serving_id")
+
+    # 🔥 Handle default counts
+    if family_count is None:
+        if "just" in serving.name.lower():
+            family_count = 1
+        elif "couple" in serving.name.lower():
+            family_count = 2
+        elif "family" in serving.name.lower():
+            raise HTTPException(status_code=400, detail="Family count required")
+
+    # 🔥 UPDATE existing row
+    existing = db.query(UserServing).filter(UserServing.user_id == user.id).first()
+
+    if not existing:
+        raise HTTPException(status_code=404, detail="No existing serving to update")
+
+    existing.serving_id = selection.serving_id
+    existing.family_count = family_count
+
+    db.commit()
+    db.refresh(existing)
+
+    return {"message": "Serving updated successfully"}
+
+@app.post("/api/recipes/save")
+def save_recipe(
+    recipe: SaveRecipeRequest,
+    db: Session = Depends(get_db)
+):
+
+    saved = SavedRecipe(
+        user_id=recipe.user_id,
+        recipe_name=recipe.recipe_name,
+        ingredients=json.dumps(recipe.ingredients),
+        steps=json.dumps(recipe.steps),
+
+        calories=recipe.calories,
+        protein=recipe.protein,
+        carbs=recipe.carbs,
+        fat=recipe.fat,
+
+        servings=recipe.servings
+    )
+
+    db.add(saved)
+    db.commit()
+
+    return {"message": "Recipe saved successfully"}
+
+@app.get("/recipes/user/{user_id}")
+def get_saved_recipes(
+    user_id: int,
+    db: Session = Depends(get_db)
+):
+
+    recipes = (
+        db.query(SavedRecipe)
+        .filter(SavedRecipe.user_id == user_id)
+        .order_by(SavedRecipe.created_at.desc())
+        .all()
+    )
+
+    return recipes
+
+
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+SMTP_EMAIL = "noreply.nutritrack@gmail.com"
+SMTP_PASSWORD = "ycfs zrzr zpax mcdn"
+
+from pydantic import BaseModel
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from crud import pwd_context
+import random
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    email: str
+    otp: str
+    new_password: str
+
+class VerifyOtpRequest(BaseModel):
+    email: str
+    otp: str
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def send_reset_email(receiver_email: str, otp: str):
+
+    msg = MIMEMultipart()
+
+    msg["From"] = SMTP_EMAIL
+    msg["To"] = receiver_email
+    msg["Subject"] = "NutriTrack Password Reset OTP"
+
+    body = f"""
+Hello,
+
+Your NutriTrack password reset code is:
+
+{otp}
+
+This code expires in 10 minutes.
+
+If you did not request a password reset, ignore this email.
+
+NutriTrack Team
+"""
+
+    msg.attach(MIMEText(body, "plain"))
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+
+@app.post("/forgot-password")
+def forgot_password(
+    request: ForgotPasswordRequest,
+    db: Session = Depends(get_db)
+):
+
+    user = db.query(User).filter(
+        User.email == request.email
+    ).first()
+
+    if not user:
+        return {"message": "If account exists, OTP sent"}
+
+    otp = str(random.randint(100000, 999999))
+
+    user.reset_otp = otp
+    user.reset_otp_expiry = datetime.utcnow() + timedelta(minutes=10)
+
+    db.commit()
+
+    send_reset_email(user.email, otp)
+
+    return {"message": "OTP sent successfully"}
+
+@app.post("/reset-password")
+def reset_password(
+    request: ResetPasswordRequest,
+    db: Session = Depends(get_db)
+):
+
+    user = db.query(User).filter(
+        User.email == request.email
+    ).first()
+
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    if user.reset_otp != request.otp:
+        raise HTTPException(400, "Invalid OTP")
+
+    if datetime.utcnow() > user.reset_otp_expiry:
+        raise HTTPException(400, "OTP expired")
+
+    user.password = hash_password(request.new_password)
+
+    user.reset_otp = None
+    user.reset_otp_expiry = None
+
+    db.commit()
+
+    return {
+        "message": "Password updated successfully"
+    }
+@app.post("/verify-reset-otp")
+def verify_reset_otp(
+    request: VerifyOtpRequest,
+    db: Session = Depends(get_db)
+):
+
+    user = db.query(User).filter(
+        User.email == request.email
+    ).first()
+
+    if not user:
+        raise HTTPException(400, "Invalid OTP")
+
+    if user.reset_otp != request.otp:
+        raise HTTPException(400, "Invalid OTP")
+
+    if datetime.utcnow() > user.reset_otp_expiry:
+        raise HTTPException(400, "OTP expired")
+
+    return {"message": "OTP verified"}
+

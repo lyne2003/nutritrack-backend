@@ -1,4 +1,16 @@
-from sqlalchemy import Column, Integer, String, DateTime, func, ForeignKey, Boolean
+# from sqlalchemy import Column, Integer, String, DateTime, func, ForeignKey, Boolean
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Text,
+    DateTime,
+    func,
+    ForeignKey,
+    Boolean
+)
+from datetime import datetime
+from sqlalchemy import Float  # 👈 ADD THIS IMPORT
 from database import Base
 
 
@@ -12,6 +24,9 @@ class User(Base):
     password = Column(String(255))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     onboarding_completed = Column(Boolean, default=False)  # ✅ New field
+    reset_otp = Column(String(10), nullable=True)
+    reset_otp_expiry = Column(DateTime, nullable=True)
+    onboarding_step = Column(Integer, default=1)
 
 # diets model
 class DietaryRestriction(Base):
@@ -63,3 +78,29 @@ class LabResult(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
     filename = Column(String(255), nullable=False)
     uploaded_at = Column(DateTime, server_default=func.now())
+    # 🔥 ADD THESE FIELDS
+    glucose = Column(Float, nullable=True)
+    ldl = Column(Float, nullable=True)
+    hdl = Column(Float, nullable=True)
+    triglycerides = Column(Float, nullable=True)
+    creatinine = Column(Float, nullable=True)
+
+class SavedRecipe(Base):
+    __tablename__ = "saved_recipes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+
+    recipe_name = Column(String(255))
+
+    ingredients = Column(Text)
+    steps = Column(Text)
+
+    calories = Column(Float)
+    protein = Column(Float)
+    carbs = Column(Float)
+    fat = Column(Float)
+
+    servings = Column(Integer)
+
+    created_at = Column(DateTime, default=datetime.utcnow)

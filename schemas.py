@@ -51,3 +51,20 @@ class ServingBase(BaseModel):
 class UserServingSelection(BaseModel):
     serving_id: int
     family_count: Optional[int] = None
+
+from pydantic import BaseModel
+from typing import List
+
+class SaveRecipeRequest(BaseModel):
+    user_id: int
+    recipe_name: str
+
+    ingredients: List[str]
+    steps: List[str]
+
+    calories: float
+    protein: float
+    carbs: float
+    fat: float
+
+    servings: int
